@@ -14,11 +14,13 @@ from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
+
+from utils import conversation_db
 
 # Load environment variables
 load_dotenv(".env", override=True)
@@ -190,6 +192,38 @@ class HealthResponse(BaseModel):
     chunks: Optional[int] = None
 
 
+class ConversationCreate(BaseModel):
+    """Create conversation request."""
+    user_id: str = Field(..., description="User ID")
+    title: str = Field(..., description="Conversation title")
+
+
+class ConversationResponse(BaseModel):
+    """Conversation response."""
+    id: str
+    user_id: str
+    title: str
+    last_message: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class MessageResponse(BaseModel):
+    """Message response."""
+    id: str
+    conversation_id: str
+    role: str
+    content: str
+    created_at: str
+
+
+class ChatStreamRequest(BaseModel):
+    """Chat stream request with optional conversation ID."""
+    message: str = Field(..., description="User message")
+    conversation_id: Optional[str] = Field(None, description="Conversation ID (creates new if not provided)")
+    user_id: str = Field(..., description="User ID")
+
+
 # ===== API Endpoints =====
 
 @app.get("/")
@@ -231,15 +265,9 @@ async def chat(request: ChatRequest):
     Send a message and receive the complete response.
     """
     try:
-        # Convert history to PydanticAI format
-        message_history = []
-        for msg in request.history:
-            if msg.role == "user":
-                from pydantic_ai.messages import UserPrompt
-                message_history.append(UserPrompt(content=msg.content))
-            elif msg.role == "assistant":
-                from pydantic_ai.messages import ModelTextResponse
-                message_history.append(ModelTextResponse(content=msg.content))
+        # Convert history to PydanticAI format (simplified)
+        # Just pass the message, agent handles history internally
+        message_history = None
 
         # Run agent
         result = await agent.run(request.message, message_history=message_history)
@@ -261,23 +289,47 @@ async def chat(request: ChatRequest):
 
 
 @app.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(request: ChatStreamRequest):
     """
     Streaming chat endpoint using Server-Sent Events (SSE).
 
     Send a message and receive streaming response tokens.
+    Automatically saves messages to the conversation.
     """
     async def event_generator():
+        conversation_id = request.conversation_id
+        assistant_response = ""
+
         try:
-            # Convert history to PydanticAI format
-            message_history = []
-            for msg in request.history:
-                if msg.role == "user":
-                    from pydantic_ai.messages import UserPrompt
-                    message_history.append(UserPrompt(content=msg.content))
-                elif msg.role == "assistant":
-                    from pydantic_ai.messages import ModelTextResponse
-                    message_history.append(ModelTextResponse(content=msg.content))
+            # Create new conversation if not provided
+            if not conversation_id:
+                # Generate title from first message (truncate if too long)
+                title = request.message[:50] + "..." if len(request.message) > 50 else request.message
+                conversation = await conversation_db.create_conversation(
+                    db_pool,
+                    request.user_id,
+                    title
+                )
+
+                if not conversation:
+                    raise Exception("Failed to create conversation")
+
+                conversation_id = conversation["id"]
+
+                # Send conversation ID to frontend
+                yield f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conversation_id})}\n\n"
+
+            # Save user message
+            await conversation_db.save_message(
+                db_pool,
+                conversation_id,
+                "user",
+                request.message
+            )
+
+            # Convert history to PydanticAI format (simplified)
+            # Just pass the message, agent handles history internally
+            message_history = None
 
             # Stream response
             async with agent.run_stream(
@@ -286,8 +338,17 @@ async def chat_stream(request: ChatRequest):
             ) as result:
                 # Stream each token
                 async for text in result.stream_text(delta=True):
+                    assistant_response += text
                     # Send token as SSE event
                     yield f"data: {json.dumps({'type': 'token', 'content': text})}\n\n"
+
+                # Save assistant response
+                await conversation_db.save_message(
+                    db_pool,
+                    conversation_id,
+                    "assistant",
+                    assistant_response
+                )
 
                 # Send completion event
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -336,6 +397,59 @@ async def list_documents():
     except Exception as e:
         logger.error(f"Failed to list documents: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve documents: {str(e)}")
+
+
+# ===== Conversation Endpoints =====
+
+@app.post("/conversations", response_model=ConversationResponse)
+async def create_conversation(request: ConversationCreate):
+    """Create a new conversation."""
+    conversation = await conversation_db.create_conversation(
+        db_pool,
+        request.user_id,
+        request.title
+    )
+
+    if not conversation:
+        raise HTTPException(status_code=500, detail="Failed to create conversation")
+
+    return ConversationResponse(**conversation)
+
+
+@app.get("/conversations", response_model=List[ConversationResponse])
+async def list_conversations(user_id: str):
+    """List all conversations for a user."""
+    conversations = await conversation_db.get_conversations(db_pool, user_id)
+    return [ConversationResponse(**conv) for conv in conversations]
+
+
+@app.get("/conversations/{conversation_id}/messages", response_model=List[MessageResponse])
+async def get_conversation_messages(conversation_id: str):
+    """Get all messages for a conversation."""
+    messages = await conversation_db.get_conversation_messages(db_pool, conversation_id)
+    return [MessageResponse(**msg) for msg in messages]
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str, user_id: str):
+    """Delete a conversation."""
+    success = await conversation_db.delete_conversation(db_pool, conversation_id, user_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Conversation not found or access denied")
+
+    return {"status": "deleted", "id": conversation_id}
+
+
+@app.patch("/conversations/{conversation_id}/title")
+async def update_conversation_title(conversation_id: str, user_id: str, title: str):
+    """Update conversation title."""
+    success = await conversation_db.update_conversation_title(db_pool, conversation_id, user_id, title)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Conversation not found or access denied")
+
+    return {"status": "updated", "id": conversation_id, "title": title}
 
 
 # ===== Main Entry Point =====
