@@ -270,6 +270,19 @@ async with agent.run_stream(user_input, message_history=history) as result:
         print(f"\rAssistant: {text}", end="", flush=True)
 ```
 
+### Vector Index Tuning (IVFFlat)
+
+The performance of the semantic search depends heavily on the `ivfflat` index configuration in `sql/schema.sql`. The `lists` parameter in the index definition is critical.
+
+```sql
+CREATE INDEX idx_chunks_embedding ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 256);
+```
+
+- **What is `lists`?** It determines how many clusters the vector data is divided into. A low number (like 1) forces a slow, exhaustive search.
+- **Rule of Thumb:** A good starting value for `lists` is `number of chunks / 1000`.
+- **Current Value:** The schema uses a default value of `256`, which is a sensible starting point for small to medium-sized knowledge bases.
+- **When to change it:** If you ingest a very large number of documents (e.g., over 500,000), you may want to update this value in `sql/schema.sql` and re-run it to rebuild the index for optimal performance.
+
 ## Docker Deployment
 
 ### Using Docker Compose

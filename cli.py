@@ -6,7 +6,6 @@ Enhanced CLI with colors, formatting, and improved user experience.
 """
 
 import asyncio
-import asyncpg
 import argparse
 import logging
 import os
@@ -15,7 +14,11 @@ from typing import List, Dict, Any
 from datetime import datetime
 
 from dotenv import load_dotenv
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent
+
+# Import centralized components
+from utils.db_utils import initialize_db, close_db, db_pool
+from utils.tools import search_knowledge_base
 
 # Load environment variables (override existing)
 load_dotenv(".env", override=True)
@@ -34,92 +37,6 @@ class Colors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
     END = '\033[0m'
-
-
-# Global database pool
-db_pool = None
-
-
-async def initialize_db():
-    """Initialize database connection pool."""
-    global db_pool
-    if not db_pool:
-        db_pool = await asyncpg.create_pool(
-            os.getenv("DATABASE_URL"),
-            min_size=2,
-            max_size=10,
-            command_timeout=60
-        )
-        # logger.info("Database connection pool initialized")
-
-
-async def close_db():
-    """Close database connection pool."""
-    global db_pool
-    if db_pool:
-        await db_pool.close()
-        # logger.info("Database connection pool closed")
-
-
-async def search_knowledge_base(ctx: RunContext[None], query: str, limit: int = 5) -> str:
-    """
-    Search the knowledge base using semantic similarity.
-
-    Args:
-        query: The search query to find relevant information
-        limit: Maximum number of results to return (default: 5)
-
-    Returns:
-        Formatted search results with source citations
-    """
-    try:
-        # Ensure database is initialized
-        if not db_pool:
-            await initialize_db()
-
-        # Generate embedding for query
-        from ingestion.embedder import create_embedder
-        embedder = create_embedder()
-        query_embedding = await embedder.embed_query(query)
-
-        # Convert to PostgreSQL vector format
-        embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
-
-        # Search using match_chunks function
-        async with db_pool.acquire() as conn:
-            results = await conn.fetch(
-                """
-                SELECT * FROM match_chunks($1::vector, $2)
-                """,
-                embedding_str,
-                limit
-            )
-
-        # Format results for response
-        if not results:
-            return "No relevant information found in the knowledge base for your query."
-
-        # Build response with sources
-        response_parts = []
-        for i, row in enumerate(results, 1):
-            similarity = row['similarity']
-            content = row['content']
-            doc_title = row['document_title']
-            doc_source = row['document_source']
-
-            response_parts.append(
-                f"[Source: {doc_title}]\n{content}\n"
-            )
-
-        if not response_parts:
-            return "Found some results but they may not be directly relevant to your query. Please try rephrasing your question."
-
-        return f"Found {len(response_parts)} relevant results:\n\n" + "\n---\n".join(response_parts)
-
-    except Exception as e:
-        # logger.error(f"Knowledge base search failed: {e}", exc_info=True)
-        return f"I encountered an error searching the knowledge base: {str(e)}"
-
 
 # Create the PydanticAI agent with the RAG tool
 agent = Agent(

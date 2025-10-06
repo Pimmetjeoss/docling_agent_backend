@@ -19,7 +19,7 @@ def get_llm_model() -> OpenAIModel:
     Returns:
         Configured OpenAI model
     """
-    llm_choice = os.getenv('LLM_CHOICE', 'gpt-4.1-mini')
+    llm_choice = os.getenv('LLM_CHOICE', 'gpt-4o-mini')
     api_key = os.getenv('OPENAI_API_KEY')
 
     if not api_key:
@@ -96,7 +96,7 @@ def get_model_info() -> dict:
     """
     return {
         "llm_provider": "openai",
-        "llm_model": os.getenv('LLM_CHOICE', 'gpt-4.1-mini'),
+        "llm_model": os.getenv('LLM_CHOICE', 'gpt-4o-mini'),
         "embedding_provider": "openai",
         "embedding_model": get_embedding_model(),
     }
